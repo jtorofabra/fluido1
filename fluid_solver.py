@@ -1,223 +1,175 @@
 import numpy as np
+from numba import njit, prange
+
+# Kernels compilados con Numba. Cada uno se compila en serie y en paralelo;
+# la versión paralela solo compensa en mallas grandes.
+PARALLEL_MIN_CELLS = 300 * 300  # umbral medido empíricamente
+
+
+def _kernel(fn):
+    # La versión paralela va sin cache: si no, ambas versiones se pisan en la cache de Numba
+    opts = dict(nogil=True, fastmath=True)
+    return njit(cache=True, **opts)(fn), njit(parallel=True, **opts)(fn)
+
+
+@njit(cache=True, nogil=True, fastmath=True)
+def _sample(field, x, y, dx):
+    # Interpolación bilineal de field en el punto (x, y)
+    ny, nx = field.shape
+    x0 = int(min(max(np.floor(x / dx), 0), nx - 2))
+    y0 = int(min(max(np.floor(y / dx), 0), ny - 2))
+    sx = (x - x0 * dx) / dx
+    sy = (y - y0 * dx) / dx
+    return (field[y0,     x0] * (1.0 - sx) * (1.0 - sy) +
+            field[y0,     x0 + 1] * sx * (1.0 - sy) +
+            field[y0 + 1, x0] * (1.0 - sx) * sy +
+            field[y0 + 1, x0 + 1] * sx * sy)
+
+
+def _project(u, v, cL, cR, cB, cT, s, over_relaxation, iterations):
+    # Gauss-Seidel red-black con SOR: primero las celdas con (i+j) par y luego
+    # las impares, para poder paralelizar cada color.
+    ny, nx = s.shape
+    for _ in range(iterations):
+        for color in range(2):
+            for i in prange(ny):
+                for j in range((i + color) % 2, nx, 2):
+                    if s[i, j] <= 0:
+                        continue
+
+                    d = (
+                        - u[i, j] + u[i, j+1]
+                        - v[i, j] + v[i+1, j]
+                    ) * over_relaxation
+
+                    u[i, j]   += d * cL[i, j]
+                    u[i, j+1] -= d * cR[i, j]
+                    v[i, j]   += d * cB[i, j]
+                    v[i+1, j] -= d * cT[i, j]
+
+
+def _advect_u(u, v, temp_u, dx, dt):
+    ny = u.shape[0]
+    nx = u.shape[1] - 1
+    temp_u[:] = u
+    for i in prange(ny):
+        for j in range(1, nx):
+            x0 = dx * j
+            y0 = dx * (i + 0.5)
+            u0 = u[i, j]
+            v0 = (v[i, j-1] + v[i+1, j-1] + v[i, j] + v[i+1, j]) * 0.25
+            x1 = x0 - dt * u0
+            y1 = y0 - dt * v0
+            temp_u[i, j] = _sample(u, x1, y1 - 0.5 * dx, dx)
+    u[:] = temp_u
+
+
+def _advect_v(u, v, temp_v, dx, dt):
+    ny = v.shape[0] - 1
+    nx = v.shape[1]
+    temp_v[:] = v
+    for i in prange(1, ny):
+        for j in range(0, nx):
+            x0 = dx * (j + 0.5)
+            y0 = dx * i
+            u0 = (u[i-1, j] + u[i-1, j+1] + u[i, j] + u[i, j+1]) * 0.25
+            v0 = v[i, j]
+            x1 = x0 - dt * u0
+            y1 = y0 - dt * v0
+            temp_v[i, j] = _sample(v, x1 - 0.5 * dx, y1, dx)
+    v[:] = temp_v
+
+
+def _advect_smoke(u, v, smoke, temp_smoke, cell_type, dx, dt):
+    ny, nx = smoke.shape
+    temp_smoke[:] = smoke
+    for i in prange(ny):
+        for j in range(nx):
+            if cell_type[i, j] == 0:
+                continue
+            x0 = dx * (j + 0.5)
+            y0 = dx * (i + 0.5)
+            u_center = 0.5 * (u[i, j] + u[i, j+1])
+            v_center = 0.5 * (v[i, j] + v[i+1, j])
+            x1 = x0 - dt * u_center
+            y1 = y0 - dt * v_center
+            temp_smoke[i, j] = _sample(smoke, x1 - 0.5 * dx, y1 - 0.5 * dx, dx)
+    smoke[:] = temp_smoke
+
+
+_PROJECT = _kernel(_project)
+_ADVECT_U = _kernel(_advect_u)
+_ADVECT_V = _kernel(_advect_v)
+_ADVECT_SMOKE = _kernel(_advect_smoke)
+
 
 class FluidSolver:
-    def __init__(self, grid, over_relaxation=1.0, dt=0.1):
+    def __init__(self, grid, over_relaxation=1.0, dt=0.1, parallel=None,
+                 buoyancy=0.0, smoke_decay=0.0):
         self.grid = grid
         self.over_relaxation = over_relaxation
         self.dt = dt
+        self.buoyancy = buoyancy
+        self.smoke_decay = smoke_decay
+        if parallel is None:
+            parallel = grid.nx * grid.ny >= PARALLEL_MIN_CELLS
+        self.parallel = parallel
+
+    def _k(self, kernel):
+        return kernel[1] if self.parallel else kernel[0]
 
     def calculate_divergence(self):
         dx = self.grid.dx
         u = self.grid.u    # shape (ny, nx+1)
         v = self.grid.v    # shape (ny+1, nx)
-        # du/dx en centros y dv/dy en centros
-        du_dx = (u[:, 1:] - u[:, :-1]) / dx         # shape (ny, nx)
-        dv_dy = (v[1:, :] - v[:-1, :]) / dx         # shape (ny, nx)
+        du_dx = (u[:, 1:] - u[:, :-1]) / dx
+        dv_dy = (v[1:, :] - v[:-1, :]) / dx
         np.copyto(self.grid.divergence, du_dx + dv_dy)
 
-    def calculate_nsum(self):
-        """
-        s = wL + wR + wB + wT
-        donde cada w* = cell(i,j) * cell(vecino)
-        """
-        ct = self.grid.cell_type  # (ny, nx)
-        ctp = np.pad(ct, pad_width=1, mode='constant', constant_values=0)
-
-        cC = ctp[1:-1, 1:-1]
-        cL = ctp[1:-1, 0:-2]
-        cR = ctp[1:-1, 2:  ]
-        cB = ctp[0:-2, 1:-1]
-        cT = ctp[2:  , 1:-1]
-
-        wL = cC * cL
-        wR = cC * cR
-        wB = cC * cB
-        wT = cC * cT
-
-        self.grid.nsum = wL + wR + wB + wT  # (ny, nx)
-        self._wL, self._wR, self._wB, self._wT = wL, wR, wB, wT
-
-    def seidel_step(self):
-        """
-        Distribuye la divergencia de cada celda a sus cuatro caras,
-        ponderando por las paredes vía cell_type.
-        """
-        # self.calculate_divergence()  # no es necesario si usamos residuo local
-        self.calculate_nsum()
-
-        ny, nx = self.grid.ny, self.grid.nx
-        u, v = self.grid.u, self.grid.v
-        s = self.grid.nsum
-        wL, wR, wB, wT = self._wL, self._wR, self._wB, self._wT
-
-        for j in range(nx):
-            for i in range(ny):
-                s_ij = s[i, j]
-                if s_ij <= 0:
-                    continue  # celda bloque o completamente rodeada de paredes
-
-                d = (
-                    - u[i, j] + u[i, j+1]
-                    - v[i, j] + v[i+1, j]
-                ) * self.over_relaxation
-
-                # signos: +L, -R, +B, -T
-                u[i, j]   += d * (wL[i, j] / s_ij)
-                u[i, j+1] -= d * (wR[i, j] / s_ij)
-                v[i, j]   += d * (wB[i, j] / s_ij)
-                v[i+1, j] -= d * (wT[i, j] / s_ij)
-
     def solve(self, iterations=70):
-        for _ in range(iterations):
-            self.seidel_step()
-
-    def sample_field(self, field, x, y):
-        "Muestrea el campo field en las coordenadas (x, y)"
-        dx = self.grid.dx
-        ny, nx = field.shape
-
-        x = np.asarray(x)
-        y = np.asarray(y)
-
-        # índices enteros de celda "inferior-izquierda"
-        x0 = np.floor(x / dx)
-        y0 = np.floor(y / dx)
-
-        # clamp para que x0+1 <= nx-1 y y0+1 <= ny-1
-        x0 = np.clip(x0, 0, nx - 2).astype(np.int64)
-        y0 = np.clip(y0, 0, ny - 2).astype(np.int64)
-
-        # fracciones dentro de la celda
-        sx = (x - x0 * dx) / dx
-        sy = (y - y0 * dx) / dx
-
-        # pesos
-        w00 = (1.0 - sx) * (1.0 - sy)
-        w10 = sx * (1.0 - sy)
-        w01 = (1.0 - sx) * sy
-        w11 = sx * sy
-
-        # índices vecinos
-        x1 = x0 + 1
-        y1 = y0 + 1
-
-        # bilinear
-        v = (field[y0, x0] * w00 +
-             field[y0, x1] * w10 +
-             field[y1, x0] * w01 +
-             field[y1, x1] * w11)
-
-        return v
+        g = self.grid
+        self._k(_PROJECT)(g.u, g.v, g.cL, g.cR, g.cB, g.cT, g.s,
+                          self.over_relaxation, iterations)
 
     def advect_u(self):
-        # preservar bordes y valores no actualizados
-        self.grid.temp_u[:] = self.grid.u.copy()
-
-        # i: todas las filas de u (0..ny-1), j: caras interiores en x (1..nx-1)
-        for i in range(0, self.grid.ny):
-            for j in range(1, self.grid.nx):
-                x0 = self.grid.dx * j
-                y0 = self.grid.dx * (i + 0.5)
-
-                u0 = self.grid.u[i, j]
-                # promedio de v en las 4 esquinas alrededor del punto u
-                v0 = (self.grid.v[i, j-1] + self.grid.v[i+1, j-1] +
-                      self.grid.v[i, j]   + self.grid.v[i+1, j]) * 0.25
-
-                # FIX-1: no restar offsets aquí; solo backtrace físico
-                x1 = x0 - self.dt * u0          # ← FIX-1
-                y1 = y0 - self.dt * v0          # ← FIX-1
-
-                # FIX-2: compensar offset MAC de u en el muestreo (y - 0.5*dx)
-                self.grid.temp_u[i, j] = self.sample_field(
-                    self.grid.u, x1, y1 - 0.5 * self.grid.dx
-                )                                # ← FIX-2
-
-        # copiar valores actualizados de vuelta (preserva bordes)
-        self.grid.u = self.grid.temp_u.copy()     # ← FIX-3
+        g = self.grid
+        self._k(_ADVECT_U)(g.u, g.v, g.temp_u, g.dx, self.dt)
 
     def advect_v(self):
-        # preservar bordes y valores no actualizados
-        self.grid.temp_v[:] = self.grid.v.copy()
-
-        # i: caras interiores en y (1..ny-1), j: todas las columnas 0..nx-1
-        for i in range(1, self.grid.ny):
-            for j in range(0, self.grid.nx):
-                x0 = self.grid.dx * (j + 0.5)
-                y0 = self.grid.dx * i
-
-                u0 = (self.grid.u[i-1, j] + self.grid.u[i-1, j+1] +
-                      self.grid.u[i,   j] + self.grid.u[i,   j+1]) * 0.25
-                v0 = self.grid.v[i, j]
-
-                x1 = x0 - self.dt * u0
-                y1 = y0 - self.dt * v0
-
-                # FIX-4: muestrear v con su offset MAC (x - 0.5*dx)
-                self.grid.temp_v[i, j] = self.sample_field(
-                    self.grid.v, x1 - 0.5 * self.grid.dx, y1
-                )                                # ← FIX-4
-
-        # copiar valores actualizados de vuelta (preserva bordes)
-        self.grid.v = self.grid.temp_v.copy()     # ← FIX-5
+        g = self.grid
+        self._k(_ADVECT_V)(g.u, g.v, g.temp_v, g.dx, self.dt)
 
     def advect_smoke(self):
-        # preservar estado previo
-        self.grid.temp_smoke[:] = self.grid.smoke
-
-        dx = self.grid.dx
-        dt = self.dt
-
-        # recorre centros de celda
-        for i in range(self.grid.ny):
-            for j in range(self.grid.nx):
-                # CAMBIO 2: no adveccionar paredes/bordes/obstáculos
-                if self.grid.cell_type[i, j] == 0:
-                    continue
-
-                # centro físico de la celda (j,i)
-                x0 = dx * (j + 0.5)
-                y0 = dx * (i + 0.5)
-
-                # velocidad en el centro (promedio de caras MAC)
-                u_center = 0.5 * (self.grid.u[i, j] + self.grid.u[i, j+1])
-                v_center = 0.5 * (self.grid.v[i, j] + self.grid.v[i+1, j])
-
-                # backtrace
-                x1 = x0 - dt * u_center
-                y1 = y0 - dt * v_center
-
-                # CAMBIO 1: samplear campo centrado → restar 0.5*dx en ambos ejes
-                self.grid.temp_smoke[i, j] = self.sample_field(self.grid.smoke,
-                                                            x1- 0.5 * dx,
-                                                            y1- 0.5 * dx) #- 0.5 * dx
-
-        # escribir resultado (bordes quedan preservados por el continue)
-        self.grid.smoke = self.grid.temp_smoke.copy()
-
+        g = self.grid
+        self._k(_ADVECT_SMOKE)(g.u, g.v, g.smoke, g.temp_smoke, g.cell_type, g.dx, self.dt)
 
     def add_gravity(self, g=9.81):
-        """Añade un término de gravedad al campo de velocidades."""
         self.grid.v[:, :] -= g * self.dt
 
+    def add_buoyancy(self):
+        # El humo sube; solo se aplica en caras con fluido a ambos lados
+        s = self.grid.smoke
+        self.grid.v[1:-1, :] += ((self.buoyancy * self.dt * 0.5) * (s[:-1, :] + s[1:, :])
+                                 * self.grid.v_mask[1:-1, :])
+
+    def decay_smoke(self):
+        self.grid.smoke *= max(0.0, 1.0 - self.smoke_decay * self.dt)
+
     def enforce_boundary_conditions(self):
-        self.grid.u[:, 0] = 0.0         # pared izquierda (u normal)
-        self.grid.u[:, -1] = 0.0        # pared derecha
-        self.grid.v[0, :] = 0.0         # pared inferior (v normal)
-        self.grid.v[-1, :] = 0.0        # pared superior
-
-
+        self.grid.u[:, 0] = 0.0
+        self.grid.u[:, -1] = 0.0
+        self.grid.v[0, :] = 0.0
+        self.grid.v[-1, :] = 0.0
 
     def general_step(self):
-        """Un paso general: advección, gravedad y corrección de presión."""
         #self.add_gravity()
-        self.solve( iterations=70)
-        # asegurar que la presión/proyección no haya introducido flujo a través de las paredes
+        if self.buoyancy:
+            self.add_buoyancy()
+        self.solve(iterations=100)
         self.enforce_boundary_conditions()
         self.advect_u()
         self.advect_v()
-        # también tras advección forzar condiciones de contorno (evita outflow por interpolación)
         self.enforce_boundary_conditions()
         self.advect_smoke()
-
-
+        if self.smoke_decay:
+            self.decay_smoke()
